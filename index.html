@@ -277,6 +277,9 @@ var DEFAULT_SETTINGS = {
   version: 2,             // версия набора настроек модели: сохранённые в браузере настройки старых версий отбрасываются
   model: {
     weights: { kd: 0.40, adr: 0.40, kpr: 0.05, wr: 0.15, stab: 0.10 },
+    stabCap: 3,           // K/D одного матча для оценки стабильности ограничивается сверху этим значением
+    stabOutlierShare: 0.10, // выбросы (по MAD) исключаются из стабильности, если их не больше этой доли матчей игрока
+    stabMadK: 3,          // выброс: |x − медиана| > stabMadK · 1.4826 · MAD
     normalize: true,      // растянуть композит так, чтобы σ оценок по пулу = spread (иначе усреднение коррелированных z сжимает шкалу ~вдвое)
     shrinkK: 8,           // псевдо-матчи сглаживания к среднему по пулу
     mapWeight: 0.7,       // доля отклонения «на карте от общего уровня», которая переносится в оценку (0 — карта не учитывается)
@@ -717,6 +720,23 @@ function analyze(db, settingsIn) {
     includedCount: matches.filter(function (m) { return m.included; }).length };
 }
 
+/* стабильность: коэффициент вариации K/D матча без выбросов (ограничение сверху + исключение редких выбросов) */
+function median(a) { var b = a.slice().sort(function (x, y) { return x - y; }), m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; }
+function stability(series, M) {
+  var n = series.length, cap = M.stabCap > 0 ? M.stabCap : Infinity;
+  var x = series.map(function (v) { return Math.min(v, cap); });
+  var res = { cv: null, used: n, excluded: 0 };
+  if (n < 2) return res;
+  var med = median(x), mad = median(x.map(function (v) { return Math.abs(v - med); })) * 1.4826;
+  var limit = Math.floor(M.stabOutlierShare * n + 1e-9), keep = x;
+  if (limit >= 1 && mad > 1e-9) {
+    var out = x.filter(function (v) { return Math.abs(v - med) > M.stabMadK * mad; });
+    if (out.length > 0 && out.length <= limit) { keep = x.filter(function (v) { return Math.abs(v - med) <= M.stabMadK * mad; }); res.excluded = out.length; }
+  }
+  var mu = mean(keep); res.used = keep.length;
+  res.cv = (keep.length >= 2 && mu > 0) ? std(keep) / mu : null;
+  return res;
+}
 function aggregate(rows, S) {
   var st = { n: rows.length, W: 0, L: 0, D: 0, unknown: 0, sumK: 0, sumD: 0, sumA: 0, rounds: 0, adrVals: [], kdSeries: [], form: [] };
   rows.forEach(function (x) {
@@ -737,8 +757,8 @@ function aggregate(rows, S) {
   st.decided = st.W + st.L;
   st.wr = st.decided ? st.W / st.decided * 100 : null;
   st.stdKd = std(st.kdSeries);
-  var mkd = mean(st.kdSeries);
-  st.cvKd = (st.n >= 2 && mkd > 0) ? st.stdKd / mkd : null;    // коэффициент вариации K/D по матчам: разброс относительно собственного уровня
+  var stb = stability(st.kdSeries, (S && S.model) || DEFAULT_SETTINGS.model);
+  st.cvKd = stb.cv; st.stabUsed = stb.used; st.stabExcluded = stb.excluded;   // коэффициент вариации K/D по матчам без выбросов
   var N = S.recentN, last = st.form.slice(-N);
   st.recent = { n: last.length, W: 0, L: 0, D: 0, kd: null, outcomes: last.map(function (f) { return f.outcome; }) };
   var rk = 0, rd = 0;
@@ -1035,7 +1055,7 @@ var api = {
   clone: clone, deepMerge: deepMerge, normNick: normNick, cmpId: cmpId, idNum: idNum, round: round, mean: mean, std: std, sum: sum, isNum: isNum,
   parseScore: parseScore, parseJsonStream: parseJsonStream, buildAliasIndex: buildAliasIndex, canonize: canonize,
   findDuplicates: findDuplicates, matchSig: matchSig, matchesIdentical: matchesIdentical, hasStats: hasStats,
-  validateMatch: validateMatch, normalizeInput: normalizeInput, previewImport: previewImport, applyImport: applyImport,
+  validateMatch: validateMatch, stability: stability, normalizeInput: normalizeInput, previewImport: previewImport, applyImport: applyImport,
   validateDb: validateDb, chronoCmp: chronoCmp, migrateDb: migrateDb, analyze: analyze, aggregate: aggregate, trendWindow: trendWindow, ratingFor: ratingFor,
   balanceTeams: balanceTeams, evaluateTeams: evaluateTeams, checkFormat: checkFormat, relDiff: relDiff, balanceLabel: balanceLabel, mulberry32: mulberry32
 };
@@ -1342,6 +1362,7 @@ function ratingBreakdown(nick, p, rt) {
   Object.keys(W).forEach(function (x) { tw += W[x]; });
   var rows = [['kd', 'K/D', s.kd, c.kd.mu, 2, 1], ['adr', 'ADR', s.adr, c.adr.mu, 1, 1], ['kpr', 'Убийств за раунд', s.kpr, c.kpr.mu, 2, 1],
     ['wr', 'Win Rate, %', s.decided ? s.W / s.decided * 100 : null, c.wr.mu * 100, 1, 1], ['stab', 'Нестабильность K/D (разброс / средний K/D; меньше — лучше)', s.cvKd, c.stab.mu, 2, 1]];
+  var stabNote = s.stabExcluded ? ' Из расчёта стабильности исключено выбросов: ' + s.stabExcluded + ' (не больше ' + Math.round(M.stabOutlierShare * 100) + '% матчей игрока).' : '';
   var tot = 0;
   var body = rows.map(function (r) {
     var z = rt.parts[r[0]] || 0, contrib = M.spread * (mdl.scale || 1) * W[r[0]] * z / tw; tot += contrib;
@@ -1350,7 +1371,7 @@ function ratingBreakdown(nick, p, rt) {
   return '<details class="note small" style="margin:8px 0"><summary><b>Из чего сложилась оценка ' + fx(rt.rating, 1) + '</b> · надёжность ' + Math.round(rt.conf * 100) + '% (' + rt.n + ' матч.)</summary>' +
     '<div class="scroll"><table><thead><tr><th class="l">Показатель</th><th>У игрока</th><th>Среднее по пулу</th><th>z после сглаживания</th><th>Вес</th><th>Вклад, баллы</th></tr></thead><tbody>' + body +
     '<tr><td class="l" colspan="5">Нейтральная база ' + M.neutral + ' + сумма вкладов' + ((mdl.zmu || mdl.scale !== 1) ? ' + центровка пула (' + fx(-M.spread * mdl.scale * mdl.zmu, 1) + ')' : '') + '</td><td><b>' + fx(M.neutral + tot - M.spread * (mdl.scale || 1) * (mdl.zmu || 0), 1) + '</b></td></tr></tbody></table></div>' +
-    '<div class="muted tiny">z — отклонение от среднего пула в стандартных отклонениях; показатели игрока перед сравнением сглажены к среднему из-за малой выборки (k=' + M.shrinkK + '), поэтому z меньше, чем «сырое» сравнение значений в таблице.' + (rt.mapAdj ? '' : '') + '</div></details>';
+    '<div class="muted tiny">z — отклонение от среднего пула в стандартных отклонениях; показатели игрока перед сравнением сглажены к среднему из-за малой выборки (k=' + M.shrinkK + '), поэтому z меньше, чем «сырое» сравнение значений в таблице.' + stabNote + (rt.mapAdj ? '' : '') + '</div></details>';
 }
 function kpi(v, l, s) { return '<div class="kpi"><div class="v">' + v + '</div><div class="l">' + l + '</div><div class="s">' + (s || '') + '</div></div>'; }
 
@@ -2325,7 +2346,11 @@ function init() {
     if (e.target.id === 'login-pw') ACTIONS['login-submit']();
     else if (e.target.id === 'lock-pw') ACTIONS['lock-go']();
   });
-  window.addEventListener('error', function (e) { toast('Ошибка: ' + (e.message || e), 'err'); });
+  window.addEventListener('error', function (e) {
+    // «Script error.» без файла и строки — ошибка чужого скрипта (например, telegram-web-app.js внутри Telegram); к нашему коду не относится
+    if (!e.filename || e.message === 'Script error.') { try { console.warn('внешний скрипт:', e.message); } catch (x) { } return; }
+    toast('Ошибка: ' + (e.message || e), 'err');
+  });
   window.addEventListener('unhandledrejection', function (e) { toast('Ошибка: ' + ((e.reason && e.reason.message) || e.reason), 'err'); });
   bootOnline().then(function () {
     if (App.online.locked) { lockScreen(); return; }
