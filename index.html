@@ -277,6 +277,7 @@ var DEFAULT_SETTINGS = {
   version: 2,             // версия набора настроек модели: сохранённые в браузере настройки старых версий отбрасываются
   model: {
     weights: { kd: 0.40, adr: 0.40, kpr: 0.05, wr: 0.15, stab: 0.10 },
+    decayHalfLife: 20,    // период полураспада веса матча в матчах игрока: матч возрастом H матчей весит вдвое меньше нового (0 — выкл., все матчи равны)
     stabCap: 3,           // K/D одного матча для оценки стабильности ограничивается сверху этим значением
     stabOutlierShare: 0.10, // выбросы (по MAD) исключаются из стабильности, если их не больше этой доли матчей игрока
     stabMadK: 3,          // выброс: |x − медиана| > stabMadK · 1.4826 · MAD
@@ -722,19 +723,28 @@ function analyze(db, settingsIn) {
 
 /* стабильность: коэффициент вариации K/D матча без выбросов (ограничение сверху + исключение редких выбросов) */
 function median(a) { var b = a.slice().sort(function (x, y) { return x - y; }), m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; }
-function stability(series, M) {
+function stability(series, M, wts) {
   var n = series.length, cap = M.stabCap > 0 ? M.stabCap : Infinity;
   var x = series.map(function (v) { return Math.min(v, cap); });
+  var w = wts && wts.length === n ? wts : x.map(function () { return 1; });
   var res = { cv: null, used: n, excluded: 0 };
   if (n < 2) return res;
   var med = median(x), mad = median(x.map(function (v) { return Math.abs(v - med); })) * 1.4826;
-  var limit = Math.floor(M.stabOutlierShare * n + 1e-9), keep = x;
+  var limit = Math.floor(M.stabOutlierShare * n + 1e-9), keepX = x, keepW = w;
   if (limit >= 1 && mad > 1e-9) {
-    var out = x.filter(function (v) { return Math.abs(v - med) > M.stabMadK * mad; });
-    if (out.length > 0 && out.length <= limit) { keep = x.filter(function (v) { return Math.abs(v - med) <= M.stabMadK * mad; }); res.excluded = out.length; }
+    var bad = x.map(function (v) { return Math.abs(v - med) > M.stabMadK * mad; }), cnt = bad.filter(Boolean).length;
+    if (cnt > 0 && cnt <= limit) {
+      keepX = x.filter(function (v, k) { return !bad[k]; }); keepW = w.filter(function (v, k) { return !bad[k]; }); res.excluded = cnt;
+    }
   }
-  var mu = mean(keep); res.used = keep.length;
-  res.cv = (keep.length >= 2 && mu > 0) ? std(keep) / mu : null;
+  res.used = keepX.length;
+  var sw = 0, sw2 = 0, sx = 0, k;
+  for (k = 0; k < keepX.length; k++) { sw += keepW[k]; sw2 += keepW[k] * keepW[k]; sx += keepW[k] * keepX[k]; }
+  if (keepX.length < 2 || !(sw > 0)) return res;
+  var mu = sx / sw, v = 0;
+  for (k = 0; k < keepX.length; k++) v += keepW[k] * (keepX[k] - mu) * (keepX[k] - mu);
+  var denom = sw - sw2 / sw;                       // поправка для весов; при равных весах = n − 1
+  res.cv = (mu > 0 && denom > 1e-9) ? Math.sqrt(v / denom) / mu : null;
   return res;
 }
 function aggregate(rows, S) {
@@ -757,8 +767,19 @@ function aggregate(rows, S) {
   st.decided = st.W + st.L;
   st.wr = st.decided ? st.W / st.decided * 100 : null;
   st.stdKd = std(st.kdSeries);
-  var stb = stability(st.kdSeries, (S && S.model) || DEFAULT_SETTINGS.model);
-  st.cvKd = stb.cv; st.stabUsed = stb.used; st.stabExcluded = stb.excluded;   // коэффициент вариации K/D по матчам без выбросов
+  var MM = (S && S.model) || DEFAULT_SETTINGS.model, H = MM.decayHalfLife > 0 ? MM.decayHalfLife : 0;
+  var wts = st.form.map(function (f, i) { return H ? Math.pow(0.5, (st.n - 1 - i) / H) : 1; });   // последний матч = 1, более старые тем меньше
+  var stb = stability(st.kdSeries, MM, wts);
+  st.cvKd = stb.cv; st.stabUsed = stb.used; st.stabExcluded = stb.excluded;   // коэффициент вариации K/D по матчам без выбросов (со взвешиванием по давности)
+  // показатели для модели: с затуханием по давности (st.m); обычные st.kd, st.adr… остаются «за всё время»
+  var sW = 0, sW2 = 0, wK = 0, wD = 0, wR = 0, aW = 0, aW2 = 0, aS = 0, dW = 0, dW2 = 0, wW = 0;
+  rows.forEach(function (x, i) {
+    var w = wts[i], r = x.r; sW += w; sW2 += w * w; wK += w * r.k; wD += w * r.d; wR += w * x.m.rounds;
+    if (isNum(r.adrUsed)) { aW += w; aW2 += w * w; aS += w * r.adrUsed; }
+    if (r.outcome === 'W' || r.outcome === 'L') { dW += w; dW2 += w * w; if (r.outcome === 'W') wW += w; }
+  });
+  st.m = { H: H, nEff: sW2 ? sW * sW / sW2 : 0, kd: wD > 0 ? wK / wD : null, kpr: wR > 0 ? wK / wR : null,
+    adr: aW > 0 ? aS / aW : null, nAdrEff: aW2 ? aW * aW / aW2 : 0, wr: dW > 0 ? wW / dW : null, decidedEff: dW2 ? dW * dW / dW2 : 0 };
   var N = S.recentN, last = st.form.slice(-N);
   st.recent = { n: last.length, W: 0, L: 0, D: 0, kd: null, outcomes: last.map(function (f) { return f.outcome; }) };
   var rk = 0, rd = 0;
@@ -788,10 +809,10 @@ function computeModel(players, matches, S) {
   var pool = Array.from(players.values()).filter(function (p) { return p.stats.n >= M.poolMin; });
   function stat(vals) { return { mu: mean(vals), sd: std(vals) }; }
   var comps = {
-    kd: stat(pool.map(function (p) { return p.stats.kd; }).filter(isNum)),
-    adr: stat(pool.map(function (p) { return p.stats.adr; }).filter(isNum)),
-    kpr: stat(pool.map(function (p) { return p.stats.kpr; }).filter(isNum)),
-    wr: stat(pool.map(function (p) { return p.stats.decided ? p.stats.W / p.stats.decided : null; }).filter(isNum)),
+    kd: stat(pool.map(function (p) { return p.stats.m.kd; }).filter(isNum)),
+    adr: stat(pool.map(function (p) { return p.stats.m.adr; }).filter(isNum)),
+    kpr: stat(pool.map(function (p) { return p.stats.m.kpr; }).filter(isNum)),
+    wr: stat(pool.map(function (p) { return p.stats.m.wr; }).filter(isNum)),
     stab: stat(pool.map(function (p) { return p.stats.cvKd; }).filter(isNum))
   };
   var kdPoolSd = comps.kd.sd || 0.3;
@@ -802,14 +823,15 @@ function computeModel(players, matches, S) {
   players.forEach(function (p) {
     var s = p.stats, n = s.n, parts = {}, rating, conf, source = 'model';
     if (n > 0) {
-      parts.kd = z(s.kd == null ? null : shrink(s.kd, n, comps.kd.mu), comps.kd);
-      parts.adr = s.nAdr ? z(shrink(s.adr, s.nAdr, comps.adr.mu), comps.adr) : 0;
-      parts.kpr = z(s.kpr == null ? null : shrink(s.kpr, n, comps.kpr.mu), comps.kpr);
-      parts.wr = s.decided ? z(shrink(s.W / s.decided, s.decided, comps.wr.mu), comps.wr) : 0;
-      parts.stab = s.cvKd != null && n >= 3 ? -z(shrink(s.cvKd, n, comps.stab.mu), comps.stab) : 0;
+      var me = s.m, ne = me.nEff;     // эффективное число матчей с учётом затухания по давности
+      parts.kd = z(me.kd == null ? null : shrink(me.kd, ne, comps.kd.mu), comps.kd);
+      parts.adr = s.nAdr ? z(shrink(me.adr, me.nAdrEff, comps.adr.mu), comps.adr) : 0;
+      parts.kpr = z(me.kpr == null ? null : shrink(me.kpr, ne, comps.kpr.mu), comps.kpr);
+      parts.wr = s.decided ? z(shrink(me.wr, me.decidedEff, comps.wr.mu), comps.wr) : 0;
+      parts.stab = s.cvKd != null && n >= 3 ? -z(shrink(s.cvKd, ne, comps.stab.mu), comps.stab) : 0;
       var zc = 0; Object.keys(W).forEach(function (k) { zc += W[k] * parts[k]; }); zc /= totalW;
       zcs[p.nick] = zc; rating = M.neutral;
-      conf = n / (n + M.shrinkK);
+      conf = ne / (ne + M.shrinkK);
     } else { rating = M.neutral; conf = 0; source = 'neutral'; }
     var manual = S.manualRatings && S.manualRatings[p.nick];
     if (isNum(manual)) { rating = manual; conf = 1; source = 'manual'; }
@@ -1360,9 +1382,10 @@ function ratingBreakdown(nick, p, rt) {
   if (!rt || rt.source !== 'model') return '';
   var mdl = App.an.model, M = mdl.params, W = mdl.weights, s = p.stats, tw = 0, c = mdl.comps;
   Object.keys(W).forEach(function (x) { tw += W[x]; });
-  var rows = [['kd', 'K/D', s.kd, c.kd.mu, 2, 1], ['adr', 'ADR', s.adr, c.adr.mu, 1, 1], ['kpr', 'Убийств за раунд', s.kpr, c.kpr.mu, 2, 1],
-    ['wr', 'Win Rate, %', s.decided ? s.W / s.decided * 100 : null, c.wr.mu * 100, 1, 1], ['stab', 'Нестабильность K/D (разброс / средний K/D; меньше — лучше)', s.cvKd, c.stab.mu, 2, 1]];
-  var stabNote = s.stabExcluded ? ' Из расчёта стабильности исключено выбросов: ' + s.stabExcluded + ' (не больше ' + Math.round(M.stabOutlierShare * 100) + '% матчей игрока).' : '';
+  var rows = [['kd', 'K/D', s.m.kd, c.kd.mu, 2, 1], ['adr', 'ADR', s.m.adr, c.adr.mu, 1, 1], ['kpr', 'Убийств за раунд', s.m.kpr, c.kpr.mu, 2, 1],
+    ['wr', 'Win Rate, %', s.m.wr == null ? null : s.m.wr * 100, c.wr.mu * 100, 1, 1], ['stab', 'Нестабильность K/D (разброс / средний K/D; меньше — лучше)', s.cvKd, c.stab.mu, 2, 1]];
+  var decNote = s.m.H ? ' Значения в таблице — с затуханием по давности (полураспад ' + s.m.H + ' матчей: свежие матчи весят больше), эффективная выборка ' + fx(s.m.nEff, 0) + ' из ' + s.n + ' матчей, поэтому они могут отличаться от «за всё время».' : '';
+  var stabNote = decNote + (s.stabExcluded ? ' Из расчёта стабильности исключено выбросов: ' + s.stabExcluded + ' (не больше ' + Math.round(M.stabOutlierShare * 100) + '% матчей игрока).' : '');
   var tot = 0;
   var body = rows.map(function (r) {
     var z = rt.parts[r[0]] || 0, contrib = M.spread * (mdl.scale || 1) * W[r[0]] * z / tw; tot += contrib;
@@ -1859,10 +1882,10 @@ VIEWS.method = function () {
     '<div class="note warn"><b>ADR.</b> В ' + App.an.matches.filter(function (m) { return m.records.some(function (r) { return r.adrState === 'anomaly'; }); }).length + ' матчах ADR записан в тысячах (суммарный урон) и не решён владельцем — в среднее не входит. Решения владельца по ADR: «суммарный урон ÷ раунды» — ' + Object.keys(App.db.adr_policy || {}).filter(function (k) { return App.db.adr_policy[k] === 'total'; }).length + ' игр, «ADR не используется» — ' + Object.keys(App.db.adr_policy || {}).filter(function (k) { return App.db.adr_policy[k] === 'skip'; }).length + ' игр (поле adr_policy в базе). Исходные значения не изменены.</div>' +
     '<h3>Оценка силы (для балансировщика)</h3>' +
     '<div class="muted small">Оценка — не научно валидированная модель, а настраиваемый композит. Все веса ниже — стартовые значения, подобранные разработчиком, не результат статистической проверки.</div>' +
-    '<ol class="clean"><li>Для каждого игрока: K/D, ADR, убийства за раунд (KPR), доля побед, нестабильность K/D (коэффициент вариации: стандартное отклонение K/D по матчам ÷ средний K/D матча; меньше — лучше).</li><li>Сглаживание: <code>v′ = (n·v + k·μ) / (n + k)</code>, μ — среднее по пулу (игроки с ≥ ' + M.poolMin + ' матчами), k = ' + M.shrinkK + ' «псевдо-матчей». Чем меньше матчей, тем сильнее оценка тянется к среднему.</li><li>Нормализация: <code>z = clamp((v′ − μ)/σ, −3, 3)</code> по пулу.</li><li>Композит: <code>c = Σ(w<sub>i</sub>·z<sub>i</sub>) / Σw<sub>i</sub></code>; растяжка по пулу: <code>Оценка = ' + M.neutral + ' + ' + M.spread + ' × (c − μ<sub>c</sub>) / σ<sub>c</sub></code> (μ<sub>c</sub>, σ<sub>c</sub> — среднее и σ композита по пулу; сейчас σ<sub>c</sub> = ' + fx(mdl.zsd, 3) + ', множитель ' + fx(mdl.scale, 2) + '). Выключается параметром <code>model.normalize = false</code>.</li><li>Достоверность: <code>n / (n + k)</code>; при n &lt; ' + M.lowSample + ' — «недостаточно данных»; нет матчей — нейтральная оценка ' + M.neutral + ' или ручная.</li><li>Карта: <code>оценка + w<sub>карты</sub>·' + M.spread + '·(множитель растяжки)·Δz·(n<sub>карты</sub>/(n<sub>карты</sub>+k<sub>карты</sub>))</code>, где Δz — сглаженная разница K/D на карте и в целом; при n<sub>карты</sub> &lt; 3 используется общая оценка.</li></ol>' +
+    '<ol class="clean"><li>Для каждого игрока: K/D, ADR, убийства за раунд (KPR), доля побед, нестабильность K/D (коэффициент вариации: стандартное отклонение K/D по матчам ÷ средний K/D матча; меньше — лучше).</li><li>Затухание по давности: матч возрастом a матчей игрока (0 — самый свежий) получает вес <code>0,5<sup>a/H</sup></code>, H = ' + (M.decayHalfLife || '—') + ' (0 — выкл.); K/D, ADR, убийства/раунд, Win Rate и стабильность считаются взвешенно; в сглаживании и достоверности вместо n используется эффективная выборка <code>n<sub>эфф</sub> = (Σw)² / Σw²</code>.</li><li>Сглаживание: <code>v′ = (n·v + k·μ) / (n + k)</code>, μ — среднее по пулу (игроки с ≥ ' + M.poolMin + ' матчами), k = ' + M.shrinkK + ' «псевдо-матчей». Чем меньше матчей, тем сильнее оценка тянется к среднему.</li><li>Нормализация: <code>z = clamp((v′ − μ)/σ, −3, 3)</code> по пулу.</li><li>Композит: <code>c = Σ(w<sub>i</sub>·z<sub>i</sub>) / Σw<sub>i</sub></code>; растяжка по пулу: <code>Оценка = ' + M.neutral + ' + ' + M.spread + ' × (c − μ<sub>c</sub>) / σ<sub>c</sub></code> (μ<sub>c</sub>, σ<sub>c</sub> — среднее и σ композита по пулу; сейчас σ<sub>c</sub> = ' + fx(mdl.zsd, 3) + ', множитель ' + fx(mdl.scale, 2) + '). Выключается параметром <code>model.normalize = false</code>.</li><li>Достоверность: <code>n / (n + k)</code>; при n &lt; ' + M.lowSample + ' — «недостаточно данных»; нет матчей — нейтральная оценка ' + M.neutral + ' или ручная.</li><li>Карта: <code>оценка + w<sub>карты</sub>·' + M.spread + '·(множитель растяжки)·Δz·(n<sub>карты</sub>/(n<sub>карты</sub>+k<sub>карты</sub>))</code>, где Δz — сглаженная разница K/D на карте и в целом; при n<sub>карты</sub> &lt; 3 используется общая оценка.</li></ol>' +
     '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(min(150px,100%),1fr))">' +
     [['kd', 'Вес K/D'], ['adr', 'Вес ADR'], ['kpr', 'Вес убийств/раунд'], ['wr', 'Вес Win Rate'], ['stab', 'Вес стабильности']].map(function (x) { return '<label class="f">' + x[1] + num('model.weights.' + x[0], W[x[0]], 0.05) + '</label>'; }).join('') +
-    '<label class="f">Сглаживание k' + num('model.shrinkK', M.shrinkK, 1) + '</label><label class="f">Вес карты' + num('model.mapWeight', M.mapWeight, 0.05) + '</label><label class="f">Сглаживание карты' + num('model.mapShrinkK', M.mapShrinkK, 1) + '</label><label class="f">Мин. матчей (порог «мало данных»)' + num('model.lowSample', M.lowSample, 1) + '</label><label class="f">Матчей для пула' + num('model.poolMin', M.poolMin, 1) + '</label><label class="f">Вес неопределённости' + num('model.uncertaintyWeight', M.uncertaintyWeight, 0.05) + '</label><label class="f">Штраф ролей' + num('model.roleWeight', M.roleWeight, 0.1) + '</label></div>' +
+    '<label class="f">Сглаживание k' + num('model.shrinkK', M.shrinkK, 1) + '</label><label class="f">Затухание: полураспад, матчей (0 — выкл.)' + num('model.decayHalfLife', M.decayHalfLife, 5) + '</label><label class="f">Вес карты' + num('model.mapWeight', M.mapWeight, 0.05) + '</label><label class="f">Сглаживание карты' + num('model.mapShrinkK', M.mapShrinkK, 1) + '</label><label class="f">Мин. матчей (порог «мало данных»)' + num('model.lowSample', M.lowSample, 1) + '</label><label class="f">Матчей для пула' + num('model.poolMin', M.poolMin, 1) + '</label><label class="f">Вес неопределённости' + num('model.uncertaintyWeight', M.uncertaintyWeight, 0.05) + '</label><label class="f">Штраф ролей' + num('model.roleWeight', M.roleWeight, 0.1) + '</label></div>' +
     '<div class="row" style="margin-top:8px"><button class="btn" data-act="set-reset">Сбросить настройки</button><span class="muted small">Пул сравнения: ' + mdl.poolSize + ' игроков; σ K/D пула = ' + fx(mdl.comps.kd.sd, 3) + '.</span></div>' +
     '<h3 style="margin-top:14px">Баланс команд</h3><ul class="clean"><li>Сила команды = сумма оценок игроков (с учётом карты, если выбрана). Абсолютная разница = |ΣA − ΣB|.</li><li>Относительная разница = |avgA − avgB| / ((avgA + avgB)/2) × 100%; если среднее &lt; 1 — показывается «—», деления на ноль нет.</li><li>Целевая функция = |ΣA − ΣB| + w<sub>неопр.</sub>·|σA − σB| + штраф ролей (две роли AWPer или IGL в одной команде). σ игрока = ' + M.spread + '·(1 − достоверность); σ команды = √Σσ².</li><li>До 20 игроков — точный перебор всех разбиений; больше — эвристика (несколько запусков + локальные обмены).</li><li>Это сопоставление оценок, а <b>не вероятность победы</b>.</li></ul></div>';
 };
